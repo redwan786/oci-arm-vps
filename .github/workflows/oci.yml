@@ -1,0 +1,72 @@
+name: oci-arm-create
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oci-arm
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 32
+    steps:
+      - name: Hunt ARM capacity
+        env:
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+        run: |
+          pip install --quiet oci-cli
+          export PATH="$HOME/.local/bin:$PATH"
+
+          mkdir -p ~/.oci
+          awk '/-----BEGIN/{p=1} p{print} /-----END/{p=0}' <<< "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=ocid1.user.oc1..aaaaaaaazb3icfg7os7ankveq6rar2aaibstcdiznbuirrei6ho6prwaw3pq"
+            echo "fingerprint=cf:05:dd:c7:f8:0b:1f:e0:d6:45:15:44:ba:f2:98:27"
+            echo "tenancy=ocid1.tenancy.oc1..aaaaaaaa4eq6mj2bwlqlcbawavfq2rsxq4cvj4mvusgnzj6763stlpqgcuhq"
+            echo "region=ap-singapore-1"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+
+          COMP=ocid1.tenancy.oc1..aaaaaaaa4eq6mj2bwlqlcbawavfq2rsxq4cvj4mvusgnzj6763stlpqgcuhq
+          SUBNET=ocid1.subnet.oc1.ap-singapore-1.aaaaaaaakfxy5eztpqpjdmyvhrs2bujnha7d47jg6cgwb6apecl6bdjeaaqa
+          IMAGE=ocid1.image.oc1.ap-singapore-1.aaaaaaaaihkypxmfxzeyjevj3eutgzlnqjazicn27goya2lpr3mdmg5to2tq
+          AD="VerH:AP-SINGAPORE-1-AD-1"
+          printf '%s\n' "$SSH_PUBKEY" > /tmp/id_rsa.pub
+
+          END=$((SECONDS+1620))
+          n=0
+          while [ $SECONDS -lt $END ]; do
+            n=$((n+1))
+            COUNT=$(oci compute instance list --compartment-id "$COMP" --all 2>/dev/null \
+              | jq '[.data[]? | select(.["display-name"]=="my-arm-vps") | select(.["lifecycle-state"]!="TERMINATED" and .["lifecycle-state"]!="TERMINATING")] | length' 2>/dev/null || echo 0)
+            if [ "$COUNT" != "0" ] && [ -n "$COUNT" ]; then
+              echo "✅ Instance already exists. Done."
+              exit 0
+            fi
+            echo "[try #$n] launching..."
+            if oci compute instance launch \
+                --compartment-id "$COMP" --availability-domain "$AD" \
+                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
+                --ssh-authorized-keys-file /tmp/id_rsa.pub \
+                --display-name my-arm-vps > /tmp/out 2> /tmp/err; then
+              echo "🎉🎉 SUCCESS! Instance created! 🎉🎉"
+              exit 0
+            fi
+            if grep -qi "TooManyRequests\|Too many requests" /tmp/err; then
+              echo "[try #$n] rate limit (429) -> wait 5 min"; sleep 300
+            elif grep -qi "capacity" /tmp/err; then
+              echo "[try #$n] out of capacity -> wait 3 min"; sleep 180
+            else
+              echo "[try #$n] unexpected error:"; cat /tmp/err; exit 1
+            fi
+          done
+          echo "Window ended; scheduler will start a new run."
