@@ -54,7 +54,7 @@ jobs:
             echo "[try #$n] launching..."
             if oci compute instance launch \
                 --compartment-id "$COMP" --availability-domain "$AD" \
-                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":4,"memoryInGBs":24}' \
+                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
                 --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
                 --ssh-authorized-keys-file /tmp/id_rsa.pub \
                 --display-name my-arm-vps > /tmp/out 2> /tmp/err; then
