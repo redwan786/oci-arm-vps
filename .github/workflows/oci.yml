@@ -1,25 +1,23 @@
 name: oci-arm-create
 
 # ==========================================================================
-#  Oracle Cloud "Always Free" capacity hunter  --  hardened v2
+#  Oracle Cloud "Always Free" capacity hunter  --  hardened v3
 #
-#  Every OCID and fingerprint now lives in GitHub Secrets, so this file is
+#  v3 fix: "oci compute instance list" prints NOTHING (not an empty JSON
+#  array) when the compartment has zero instances. v2 treated that empty
+#  output as a fatal error and died with "could not list instances".
+#  Now empty output = 0 instances, and only a non-zero CLI exit code is
+#  treated as a real failure.
+#
+#  Every OCID and fingerprint lives in GitHub Secrets, so this file is
 #  safe even in a PUBLIC repository.
 #
 #  REQUIRED secrets:
-#    OCI_KEY          whole oci_api_key.pem file (BEGIN and END lines too)
-#    SSH_PUBKEY       your id_rsa.pub / id_ed25519.pub one-liner
-#    OCI_USER         ocid1.user.oc1..
-#    OCI_FINGERPRINT  cf:05:dd:...
-#    OCI_TENANCY      ocid1.tenancy.oc1..
-#    OCI_REGION       ap-singapore-1
-#    OCI_SUBNET       ocid1.subnet.oc1...
+#    OCI_KEY  SSH_PUBKEY  OCI_USER  OCI_FINGERPRINT  OCI_TENANCY
+#    OCI_REGION  OCI_SUBNET
 #
 #  OPTIONAL secrets (auto-detected when left empty):
-#    OCI_COMPARTMENT  defaults to OCI_TENANCY
-#    OCI_AD           defaults to the first availability domain
-#    OCI_IMAGE_ARM    newest Canonical Ubuntu for A1.Flex
-#    OCI_IMAGE_X86    newest Canonical Ubuntu for E2.1.Micro
+#    OCI_COMPARTMENT  OCI_AD  OCI_IMAGE_ARM  OCI_IMAGE_X86
 # ==========================================================================
 
 on:
@@ -56,6 +54,8 @@ jobs:
       OCI_IMAGE_X86: ${{ secrets.OCI_IMAGE_X86 }}
       ARM_NAME: my-arm-vps
       AMD_NAME: my-amd-vps
+      # stops the OCI CLI from polluting stderr with the key-label warning
+      SUPPRESS_LABEL_WARNING: "True"
 
     steps:
       - name: Install OCI CLI
@@ -94,14 +94,14 @@ jobs:
           set -uo pipefail
           if ! oci iam region list > /dev/null 2> /tmp/pf; then
             echo "::error::OCI auth failed - check OCI_KEY, OCI_USER, OCI_FINGERPRINT, OCI_TENANCY"
-            head -c 800 /tmp/pf
+            head -c 1200 /tmp/pf
             exit 1
           fi
           COMP="${OCI_COMPARTMENT:-}"
           if [ -z "$COMP" ]; then COMP="$OCI_TENANCY"; fi
           if ! oci network subnet get --subnet-id "$OCI_SUBNET" > /dev/null 2> /tmp/pf; then
             echo "::error::OCI_SUBNET is wrong, deleted, or in a different region"
-            head -c 800 /tmp/pf
+            head -c 1200 /tmp/pf
             exit 1
           fi
           AD="${OCI_AD:-}"
@@ -112,35 +112,64 @@ jobs:
             echo "::error::could not resolve an availability domain"
             exit 1
           fi
+          IMGS=$(oci compute image list --compartment-id "$COMP" --operating-system "Canonical Ubuntu" --sort-by TIMECREATED --sort-order DESC 2> /dev/null)
           IMG_ARM="${OCI_IMAGE_ARM:-}"
-          if [ -z "$IMG_ARM" ]; then
-            IMG_ARM=$(oci compute image list --compartment-id "$COMP" --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC 2> /dev/null | jq -r '.data[0].id // empty')
+          if [ -z "$IMG_ARM" ] && [ -n "$IMGS" ]; then
+            IMG_ARM=$(echo "$IMGS" | jq -r '[ .data[]? | select(.["display-name"] | test("aarch64")) | select(.["display-name"] | test("Minimal") | not) ] | .[0].id // empty')
           fi
           IMG_X86="${OCI_IMAGE_X86:-}"
-          if [ -z "$IMG_X86" ]; then
-            IMG_X86=$(oci compute image list --compartment-id "$COMP" --operating-system "Canonical Ubuntu" --shape VM.Standard.E2.1.Micro --sort-by TIMECREATED --sort-order DESC 2> /dev/null | jq -r '.data[0].id // empty')
+          if [ -z "$IMG_X86" ] && [ -n "$IMGS" ]; then
+            IMG_X86=$(echo "$IMGS" | jq -r '[ .data[]? | select(.["display-name"] | test("aarch64") | not) | select(.["display-name"] | test("Minimal") | not) ] | .[0].id // empty')
           fi
           if [ -z "$IMG_ARM" ]; then
-            echo "::error::could not resolve an ARM Ubuntu image"
+            echo "::error::could not resolve an ARM (aarch64) Ubuntu image - set the OCI_IMAGE_ARM secret by hand"
             exit 1
           fi
           echo "R_COMP=$COMP" >> "$GITHUB_ENV"
           echo "R_AD=$AD" >> "$GITHUB_ENV"
           echo "R_IMG_ARM=$IMG_ARM" >> "$GITHUB_ENV"
           echo "R_IMG_X86=$IMG_X86" >> "$GITHUB_ENV"
-          echo "auth OK / subnet OK"
-          echo "AD        = $AD"
-          echo "image arm = $IMG_ARM"
-          echo "image x86 = ${IMG_X86:-(none - AMD fallback disabled)}"
+          echo "===== preflight summary ====="
+          echo "auth        : OK"
+          echo "subnet      : OK"
+          echo "region      : $OCI_REGION"
+          echo "avail domain: $AD"
+          echo "image arm   : $IMG_ARM"
+          if [ -n "$IMG_X86" ]; then
+            echo "image x86   : $IMG_X86"
+          else
+            echo "image x86   : (none) - AMD E2.1.Micro fallback is DISABLED"
+          fi
 
       - name: Hunt capacity
         id: hunt
         run: |
           set -uo pipefail
-          sleep $(( RANDOM % 50 ))
 
+          # jitter keeps us off the same second as every other hunter bot,
+          # but skip it when a human pressed Run workflow
+          if [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            sleep $(( RANDOM % 50 ))
+          fi
+
+          # prints a number, or the word ERR when the API call itself failed.
+          # NOTE: the OCI CLI prints NOTHING when there are zero instances,
+          # so empty output must be read as 0 - not as a failure.
           alive() {
-            oci compute instance list --compartment-id "$R_COMP" --all 2> /tmp/lserr | jq --arg n "$1" '[ .data[]? | select(.["display-name"] == $n) | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") ] | length'
+            local out rc n
+            out=$(oci compute instance list --compartment-id "$R_COMP" --all 2> /tmp/lserr)
+            rc=$?
+            if [ "$rc" != "0" ]; then
+              echo "ERR"
+              return 0
+            fi
+            if [ -z "$out" ]; then
+              echo "0"
+              return 0
+            fi
+            n=$(echo "$out" | jq --arg d "$1" '[ .data[]? | select(.["display-name"] == $d) | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") ] | length' 2> /dev/null)
+            if [ -z "$n" ]; then n="0"; fi
+            echo "$n"
           }
 
           launch_arm() {
@@ -158,9 +187,9 @@ jobs:
             n=$(( n + 1 ))
 
             HAVE_ARM=$(alive "$ARM_NAME")
-            if [ -z "$HAVE_ARM" ]; then
-              echo "::error::could not list instances"
-              head -c 800 /tmp/lserr
+            if [ "$HAVE_ARM" = "ERR" ]; then
+              echo "::error::the instance-list API call failed"
+              head -c 1200 /tmp/lserr
               exit 1
             fi
             if [ "$HAVE_ARM" != "0" ]; then
@@ -176,7 +205,7 @@ jobs:
               echo "shape=VM.Standard.A1.Flex 2 OCPU 12GB" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            ERR=$(head -c 700 /tmp/err)
+            ERR=$(head -c 1200 /tmp/err)
             echo "    $ERR"
 
             if echo "$ERR" | grep -qiE "NotAuthenticated|NotAuthorizedOrNotFound|CannotParseRequest|InvalidParameter"; then
@@ -203,7 +232,7 @@ jobs:
                   echo "shape=VM.Standard.E2.1.Micro" >> "$GITHUB_OUTPUT"
                   exit 0
                 fi
-                echo "    amd error: $(head -c 400 /tmp/err2)"
+                echo "    amd error: $(head -c 600 /tmp/err2)"
               fi
             fi
 
