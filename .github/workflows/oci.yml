@@ -1,9 +1,37 @@
 name: oci-arm-create
 
+# ==========================================================================
+#  Oracle Cloud "Always Free" capacity hunter  --  hardened v2
+#
+#  Every OCID and fingerprint now lives in GitHub Secrets, so this file is
+#  safe even in a PUBLIC repository.
+#
+#  REQUIRED secrets:
+#    OCI_KEY          whole oci_api_key.pem file (BEGIN and END lines too)
+#    SSH_PUBKEY       your id_rsa.pub / id_ed25519.pub one-liner
+#    OCI_USER         ocid1.user.oc1..
+#    OCI_FINGERPRINT  cf:05:dd:...
+#    OCI_TENANCY      ocid1.tenancy.oc1..
+#    OCI_REGION       ap-singapore-1
+#    OCI_SUBNET       ocid1.subnet.oc1...
+#
+#  OPTIONAL secrets (auto-detected when left empty):
+#    OCI_COMPARTMENT  defaults to OCI_TENANCY
+#    OCI_AD           defaults to the first availability domain
+#    OCI_IMAGE_ARM    newest Canonical Ubuntu for A1.Flex
+#    OCI_IMAGE_X86    newest Canonical Ubuntu for E2.1.Micro
+# ==========================================================================
+
 on:
+  # Deliberately NOT :00/:15/:30/:45 -- GitHub delays schedules at the top of
+  # the hour, and every other capacity-hunting bot fires on those minutes too.
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
 
 concurrency:
   group: oci-arm
@@ -12,63 +40,191 @@ concurrency:
 jobs:
   launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 32
+    timeout-minutes: 18
+
+    env:
+      OCI_KEY: ${{ secrets.OCI_KEY }}
+      SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+      OCI_USER: ${{ secrets.OCI_USER }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_SUBNET: ${{ secrets.OCI_SUBNET }}
+      OCI_COMPARTMENT: ${{ secrets.OCI_COMPARTMENT }}
+      OCI_AD: ${{ secrets.OCI_AD }}
+      OCI_IMAGE_ARM: ${{ secrets.OCI_IMAGE_ARM }}
+      OCI_IMAGE_X86: ${{ secrets.OCI_IMAGE_X86 }}
+      ARM_NAME: my-arm-vps
+      AMD_NAME: my-amd-vps
+
     steps:
-      - name: Hunt ARM capacity
-        env:
-          OCI_KEY: ${{ secrets.OCI_KEY }}
-          SSH_PUBKEY: ${{ secrets.SSH_PUBKEY }}
+      - name: Install OCI CLI
         run: |
           pip install --quiet oci-cli
-          export PATH="$HOME/.local/bin:$PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      - name: Write OCI config
+        run: |
+          set -uo pipefail
           mkdir -p ~/.oci
-          awk '/-----BEGIN/{p=1} p{print} /-----END/{p=0}' <<< "$OCI_KEY" > ~/.oci/key.pem
+          echo "$OCI_KEY" > ~/.oci/key.pem
           chmod 600 ~/.oci/key.pem
+          if ! openssl rsa -in ~/.oci/key.pem -check -noout > /dev/null 2>&1; then
+            echo "::error::OCI_KEY is not a valid RSA private key. Paste the whole oci_api_key.pem file, BEGIN and END lines included."
+            exit 1
+          fi
           {
             echo "[DEFAULT]"
-            echo "user=ocid1.user.oc1..aaaaaaaazb3icfg7os7ankveq6rar2aaibstcdiznbuirrei6ho6prwaw3pq"
-            echo "fingerprint=cf:05:dd:c7:f8:0b:1f:e0:d6:45:15:44:ba:f2:98:27"
-            echo "tenancy=ocid1.tenancy.oc1..aaaaaaaa4eq6mj2bwlqlcbawavfq2rsxq4cvj4mvusgnzj6763stlpqgcuhq"
-            echo "region=ap-singapore-1"
+            echo "user=$OCI_USER"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY"
+            echo "region=$OCI_REGION"
             echo "key_file=$HOME/.oci/key.pem"
           } > ~/.oci/config
           chmod 600 ~/.oci/config
+          echo "$SSH_PUBKEY" > /tmp/id_rsa.pub
+          if [ ! -s /tmp/id_rsa.pub ]; then
+            echo "::error::SSH_PUBKEY secret is empty"
+            exit 1
+          fi
+          echo "config written"
 
-          COMP=ocid1.tenancy.oc1..aaaaaaaa4eq6mj2bwlqlcbawavfq2rsxq4cvj4mvusgnzj6763stlpqgcuhq
-          SUBNET=ocid1.subnet.oc1.ap-singapore-1.aaaaaaaakfxy5eztpqpjdmyvhrs2bujnha7d47jg6cgwb6apecl6bdjeaaqa
-          IMAGE=ocid1.image.oc1.ap-singapore-1.aaaaaaaaihkypxmfxzeyjevj3eutgzlnqjazicn27goya2lpr3mdmg5to2tq
-          AD="VerH:AP-SINGAPORE-1-AD-1"
-          printf '%s\n' "$SSH_PUBKEY" > /tmp/id_rsa.pub
+      - name: Preflight and auto-detect
+        run: |
+          set -uo pipefail
+          if ! oci iam region list > /dev/null 2> /tmp/pf; then
+            echo "::error::OCI auth failed - check OCI_KEY, OCI_USER, OCI_FINGERPRINT, OCI_TENANCY"
+            head -c 800 /tmp/pf
+            exit 1
+          fi
+          COMP="${OCI_COMPARTMENT:-}"
+          if [ -z "$COMP" ]; then COMP="$OCI_TENANCY"; fi
+          if ! oci network subnet get --subnet-id "$OCI_SUBNET" > /dev/null 2> /tmp/pf; then
+            echo "::error::OCI_SUBNET is wrong, deleted, or in a different region"
+            head -c 800 /tmp/pf
+            exit 1
+          fi
+          AD="${OCI_AD:-}"
+          if [ -z "$AD" ]; then
+            AD=$(oci iam availability-domain list --compartment-id "$OCI_TENANCY" 2> /dev/null | jq -r '.data[0].name // empty')
+          fi
+          if [ -z "$AD" ]; then
+            echo "::error::could not resolve an availability domain"
+            exit 1
+          fi
+          IMG_ARM="${OCI_IMAGE_ARM:-}"
+          if [ -z "$IMG_ARM" ]; then
+            IMG_ARM=$(oci compute image list --compartment-id "$COMP" --operating-system "Canonical Ubuntu" --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC 2> /dev/null | jq -r '.data[0].id // empty')
+          fi
+          IMG_X86="${OCI_IMAGE_X86:-}"
+          if [ -z "$IMG_X86" ]; then
+            IMG_X86=$(oci compute image list --compartment-id "$COMP" --operating-system "Canonical Ubuntu" --shape VM.Standard.E2.1.Micro --sort-by TIMECREATED --sort-order DESC 2> /dev/null | jq -r '.data[0].id // empty')
+          fi
+          if [ -z "$IMG_ARM" ]; then
+            echo "::error::could not resolve an ARM Ubuntu image"
+            exit 1
+          fi
+          echo "R_COMP=$COMP" >> "$GITHUB_ENV"
+          echo "R_AD=$AD" >> "$GITHUB_ENV"
+          echo "R_IMG_ARM=$IMG_ARM" >> "$GITHUB_ENV"
+          echo "R_IMG_X86=$IMG_X86" >> "$GITHUB_ENV"
+          echo "auth OK / subnet OK"
+          echo "AD        = $AD"
+          echo "image arm = $IMG_ARM"
+          echo "image x86 = ${IMG_X86:-(none - AMD fallback disabled)}"
 
-          END=$((SECONDS+1620))
+      - name: Hunt capacity
+        id: hunt
+        run: |
+          set -uo pipefail
+          sleep $(( RANDOM % 50 ))
+
+          alive() {
+            oci compute instance list --compartment-id "$R_COMP" --all 2> /tmp/lserr | jq --arg n "$1" '[ .data[]? | select(.["display-name"] == $n) | select(.["lifecycle-state"] != "TERMINATED" and .["lifecycle-state"] != "TERMINATING") ] | length'
+          }
+
+          launch_arm() {
+            oci compute instance launch --compartment-id "$R_COMP" --availability-domain "$R_AD" --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' --image-id "$R_IMG_ARM" --subnet-id "$OCI_SUBNET" --assign-public-ip true --ssh-authorized-keys-file /tmp/id_rsa.pub --display-name "$ARM_NAME" > /tmp/out 2> /tmp/err
+          }
+
+          launch_amd() {
+            oci compute instance launch --compartment-id "$R_COMP" --availability-domain "$R_AD" --shape VM.Standard.E2.1.Micro --image-id "$R_IMG_X86" --subnet-id "$OCI_SUBNET" --assign-public-ip true --ssh-authorized-keys-file /tmp/id_rsa.pub --display-name "$AMD_NAME" > /tmp/out2 2> /tmp/err2
+          }
+
+          END=$(( SECONDS + 780 ))
           n=0
-          while [ $SECONDS -lt $END ]; do
-            n=$((n+1))
-            COUNT=$(oci compute instance list --compartment-id "$COMP" --all 2>/dev/null \
-              | jq '[.data[]? | select(.["display-name"]=="my-arm-vps") | select(.["lifecycle-state"]!="TERMINATED" and .["lifecycle-state"]!="TERMINATING")] | length' 2>/dev/null || echo 0)
-            if [ "$COUNT" != "0" ] && [ -n "$COUNT" ]; then
-              echo "✅ Instance already exists. Done."
+
+          while [ "$SECONDS" -lt "$END" ]; do
+            n=$(( n + 1 ))
+
+            HAVE_ARM=$(alive "$ARM_NAME")
+            if [ -z "$HAVE_ARM" ]; then
+              echo "::error::could not list instances"
+              head -c 800 /tmp/lserr
+              exit 1
+            fi
+            if [ "$HAVE_ARM" != "0" ]; then
+              echo "ARM instance already exists - nothing left to hunt"
+              echo "state=exists" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "[try #$n] launching..."
-            if oci compute instance launch \
-                --compartment-id "$COMP" --availability-domain "$AD" \
-                --shape VM.Standard.A1.Flex --shape-config '{"ocpus":2,"memoryInGBs":12}' \
-                --image-id "$IMAGE" --subnet-id "$SUBNET" --assign-public-ip true \
-                --ssh-authorized-keys-file /tmp/id_rsa.pub \
-                --display-name my-arm-vps > /tmp/out 2> /tmp/err; then
-              echo "🎉🎉 SUCCESS! Instance created! 🎉🎉"
+
+            echo "--- try #$n : A1.Flex 2 OCPU / 12 GB"
+            if launch_arm; then
+              echo "SUCCESS - ARM instance is provisioning"
+              echo "state=created" >> "$GITHUB_OUTPUT"
+              echo "shape=VM.Standard.A1.Flex 2 OCPU 12GB" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            if grep -qi "TooManyRequests\|Too many requests" /tmp/err; then
-              echo "[try #$n] rate limit (429) -> wait 5 min"; sleep 300
-            elif grep -qi "capacity" /tmp/err; then
-              echo "[try #$n] out of capacity -> wait 3 min"; sleep 180
+            ERR=$(head -c 700 /tmp/err)
+            echo "    $ERR"
+
+            if echo "$ERR" | grep -qiE "NotAuthenticated|NotAuthorizedOrNotFound|CannotParseRequest|InvalidParameter"; then
+              echo "::error::permanent configuration error - retrying will never help, fix the secrets"
+              exit 1
+            fi
+
+            NEED_AMD=0
+            if echo "$ERR" | grep -qiE "LimitExceeded|service limits were exceeded|QuotaExceeded"; then
+              echo "::warning::the A1 free allowance is already used up"
+              NEED_AMD=1
+            fi
+            if echo "$ERR" | grep -qiE "capacity"; then
+              if [ $(( n % 5 )) -eq 0 ]; then NEED_AMD=1; fi
+            fi
+
+            if [ "$NEED_AMD" = "1" ] && [ -n "$R_IMG_X86" ]; then
+              HAVE_AMD=$(alive "$AMD_NAME")
+              if [ "$HAVE_AMD" = "0" ]; then
+                echo "--- fallback : VM.Standard.E2.1.Micro (AMD, 1 GB) - also Always Free"
+                if launch_amd; then
+                  echo "SUCCESS - AMD micro is provisioning"
+                  echo "state=created" >> "$GITHUB_OUTPUT"
+                  echo "shape=VM.Standard.E2.1.Micro" >> "$GITHUB_OUTPUT"
+                  exit 0
+                fi
+                echo "    amd error: $(head -c 400 /tmp/err2)"
+              fi
+            fi
+
+            if echo "$ERR" | grep -qiE "TooManyRequests|Too many requests|429"; then
+              echo "    rate limited -> sleeping 240s"
+              sleep 240
+            elif echo "$ERR" | grep -qiE "capacity"; then
+              echo "    out of host capacity -> sleeping 150s"
+              sleep 150
             else
-              echo "[try #$n] unexpected error (network/timeout), retrying in 60s..."
-              cat /tmp/err
+              echo "    unrecognised error -> sleeping 60s"
               sleep 60
             fi
           done
-          echo "Window ended; scheduler will start a new run."
+
+          echo "window closed after $n tries - the next run starts in a few minutes"
+          echo "state=none" >> "$GITHUB_OUTPUT"
+
+      - name: Notify me by opening an issue
+        if: steps.hunt.outputs.state == 'created'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --title "Oracle Cloud instance created" --body "Shape: ${{ steps.hunt.outputs.shape }}. Next: copy the public IP from the OCI console, open port 443 in the VCN security list AND inside the instance firewall, then deploy Vaultwarden." || echo "could not open an issue - check the Actions tab instead"
